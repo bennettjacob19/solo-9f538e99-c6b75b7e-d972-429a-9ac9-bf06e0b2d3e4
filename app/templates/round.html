@@ -78,13 +78,16 @@
 
 {% if round.budgets %}
 <section class="panel">
-  <h3>涉及的 PodDisruptionBudget</h3>
+  <h3>涉及的 PodDisruptionBudget（最新读数）</h3>
   <table>
-    <thead><tr><th>命名空间 / 名称</th><th>允许中断</th><th>健康 / 期望</th><th>期望 Pod 数</th></tr></thead>
+    <thead><tr><th>命名空间 / 名称</th><th>匹配数</th><th>健康数</th><th>期望健康数</th><th>允许驱逐数</th></tr></thead>
     <tbody>
       {% for budget in round.budgets %}
         <tr>
           <td class="mono">{{ budget.namespace }}/{{ budget.name }}</td>
+          <td>{{ budget.expected }}</td>
+          <td>{{ budget.healthy }}</td>
+          <td>{{ budget.desired }}</td>
           <td>
             {% if budget.allowed > 0 %}
               <span class="badge ok">{{ budget.allowed }}</span>
@@ -92,14 +95,14 @@
               <span class="badge danger">0</span>
             {% endif %}
           </td>
-          <td>{{ budget.healthy }} / {{ budget.desired }}</td>
-          <td>{{ budget.expected }}</td>
         </tr>
       {% endfor %}
     </tbody>
   </table>
   <p class="small muted" style="margin-bottom:0">
-    预算是否允许驱逐由 API Server 裁定；两节点并行排空共用同一份预算额度。
+    驱逐获准（待退出）时健康数立即减少，Pod 实际退出后匹配数才减少；
+    使用 maxUnavailable 时期望健康数随匹配数更新。是否放行由 API Server
+    按请求生效时的阈值与计数裁定；两节点并行排空共用同一份额度。
   </p>
 </section>
 {% endif %}

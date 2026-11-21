@@ -80,15 +80,15 @@ class SimPDB:
     generation: int = 1
     resource_version: int = 1
 
-    def budget(self, pods: list[SimPod]) -> dict[str, int]:
-        matching = [
-            pod
-            for pod in pods
-            if pod.namespace == self.namespace
-            and all(pod.labels.get(k) == v for k, v in self.selector.items())
-        ]
-        expected = len(matching)
-        healthy = sum(1 for pod in matching if pod.healthy)
+    def budget_from_counts(self, expected: int, healthy: int) -> dict[str, int]:
+        """Budget status from the indexed counts, without touching pods.
+
+        ``expected`` is the number of matching pod objects; a pod that is
+        terminating still matches until it actually exits.  ``healthy`` drops
+        as soon as a pod stops being ready, including the moment an eviction is
+        granted.  For ``maxUnavailable`` the desired count is derived from the
+        current match count, so it follows pods leaving the index.
+        """
         if self.min_available is not None:
             desired = self.min_available
         else:
@@ -99,6 +99,23 @@ class SimPDB:
             "desiredHealthy": desired,
             "expectedPods": expected,
         }
+
+    def budget(self, pods: list[SimPod]) -> dict[str, int]:
+        """Reference implementation over an explicit pod list.
+
+        Normal request paths never call this: they read the incremental index
+        maintained by :class:`ClusterState`, which keeps per-operation cost
+        independent of the total pod count.
+        """
+        matching = [
+            pod
+            for pod in pods
+            if pod.namespace == self.namespace
+            and all(pod.labels.get(k) == v for k, v in self.selector.items())
+        ]
+        return self.budget_from_counts(
+            len(matching), sum(1 for pod in matching if pod.healthy)
+        )
 
 
 @dataclass
@@ -111,12 +128,42 @@ class SimNode:
 
 
 class ClusterState:
+    """Cluster state plus incremental PodDisruptionBudget accounting.
+
+    Budget numbers are maintained as an index while pods change, not by
+    re-scanning every pod:
+
+    * ``_pdb_members[pod_key]`` records which budgets match that pod.
+    * ``_pdb_counts[budget_key]`` is ``[expected, healthy]``.
+    * ``_pdb_selectors[(namespace, label, value)]`` finds candidate budgets
+      from a pod's labels without walking the pod list.
+
+    An eviction request therefore costs O(labels + matching budgets), a
+    budget read costs O(1), and letting a pod exit costs O(budgets matching
+    that pod) — none of them grows with the total number of pods.
+    """
+
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.nodes: dict[str, SimNode] = {}
         self.pods: dict[tuple[str, str], SimPod] = {}
         self.pdbs: dict[tuple[str, str], SimPDB] = {}
         self.events: list[dict[str, Any]] = []
+        # Budget index; rebuilt by reset() and maintained by the mutators.
+        self._pdb_selectors: dict[tuple[str, str, str], set[tuple[str, str]]] = {}
+        self._empty_selector_pdbs: dict[str, set[tuple[str, str]]] = {}
+        self._pdb_members: dict[tuple[str, str], set[tuple[str, str]]] = {}
+        self._pdb_counts: dict[tuple[str, str], list[int]] = {}
+        # Observability for the rehearsal page and the scaling self-test.
+        # ``budget_pod_scans`` counts full pod-list walks taken on a budget
+        # path; it must stay 0 while serving requests if the index is used,
+        # while ``budget_state_reads`` grows once per budget number read.
+        self.metrics: dict[str, int] = {
+            "budget_pod_scans": 0,
+            "budget_state_reads": 0,
+            "budget_index_updates": 0,
+            "budget_index_builds": 0,
+        }
         self.reset()
 
     # -- seed --------------------------------------------------------------
@@ -126,6 +173,7 @@ class ClusterState:
             self.pods = {}
             self.pdbs = {}
             self.events = []
+            self._reset_budget_index()
 
             def add(
                 namespace: str,
@@ -169,7 +217,151 @@ class ClusterState:
             self.pdbs[("shop", "cache-pdb")] = SimPDB(
                 name="cache-pdb", namespace="shop", selector={"app": "cache"}, min_available=1
             )
+            # One index build at seed time; later operations only adjust it.
+            self._rebuild_budget_index()
             self._event("reset", "演练环境已恢复到初始状态")
+
+    # -- budget index ------------------------------------------------------
+    def _reset_budget_index(self) -> None:
+        self._pdb_selectors = {}
+        self._empty_selector_pdbs = {}
+        self._pdb_members = {}
+        self._pdb_counts = {}
+        for metric in (
+            "budget_pod_scans",
+            "budget_state_reads",
+            "budget_index_updates",
+        ):
+            self.metrics[metric] = 0
+        self.metrics["budget_index_builds"] = 0
+
+    def _register_pdb(self, pdb: SimPDB) -> None:
+        key = (pdb.namespace, pdb.name)
+        self._pdb_counts[key] = [0, 0]
+        if not pdb.selector:
+            self._empty_selector_pdbs.setdefault(pdb.namespace, set()).add(key)
+            return
+        for label, value in pdb.selector.items():
+            self._pdb_selectors.setdefault(
+                (pdb.namespace, label, value), set()
+            ).add(key)
+
+    def _candidate_pdbs(
+        self, namespace: str, labels: dict[str, str]
+    ) -> set[tuple[str, str]]:
+        """Budgets that could match, from the label index only."""
+        candidates = set(self._empty_selector_pdbs.get(namespace, ()))
+        selectors = self._pdb_selectors
+        for label, value in labels.items():
+            candidates.update(selectors.get((namespace, label, value), ()))
+        return candidates
+
+    def _matching_budgets(
+        self, namespace: str, labels: dict[str, str]
+    ) -> set[tuple[str, str]]:
+        matched: set[tuple[str, str]] = set()
+        for key in self._candidate_pdbs(namespace, labels):
+            pdb = self.pdbs.get(key)
+            if pdb is None:
+                continue
+            if all(labels.get(k) == v for k, v in pdb.selector.items()):
+                matched.add(key)
+        return matched
+
+    def _attach_pod(self, pod: SimPod) -> None:
+        """Add one pod to the budget index.  Cost: labels + matching budgets."""
+        self._detach_pod(pod)
+        members = self._matching_budgets(pod.namespace, pod.labels)
+        self._pdb_members[pod.key] = members
+        healthy = 1 if pod.healthy else 0
+        for key in members:
+            counts = self._pdb_counts.setdefault(key, [0, 0])
+            counts[0] += 1
+            counts[1] += healthy
+        self.metrics["budget_index_updates"] += 1
+
+    def _detach_pod(self, pod: SimPod) -> None:
+        """Remove one pod from the budget index.
+
+        Matching count drops here — this is the "pod actually exited" edge,
+        not the moment eviction was granted.
+        """
+        members = self._pdb_members.pop(pod.key, None)
+        if not members:
+            return
+        healthy = 1 if pod.healthy else 0
+        for key in members:
+            counts = self._pdb_counts.get(key)
+            if counts is None:
+                continue
+            counts[0] -= 1
+            counts[1] -= healthy
+        self.metrics["budget_index_updates"] += 1
+
+    def _adjust_pod_health(self, pod: SimPod, delta: int) -> None:
+        """Apply one healthy-count transition to every budget covering the pod."""
+        for key in self._pdb_members.get(pod.key, ()):
+            counts = self._pdb_counts.get(key)
+            if counts is not None:
+                counts[1] += delta
+        self.metrics["budget_index_updates"] += 1
+
+    def _refresh_pod_health(self, pod: SimPod, was_healthy: bool) -> None:
+        """Adjust healthy counts after a readiness change."""
+        if was_healthy == pod.healthy:
+            return
+        self._adjust_pod_health(pod, 1 if pod.healthy else -1)
+
+    def _rebuild_budget_index(self) -> None:
+        """Seed the index.  Only run on reset, never on a request path."""
+        self._pdb_selectors = {}
+        self._empty_selector_pdbs = {}
+        self._pdb_members = {}
+        self._pdb_counts = {}
+        for pdb in self.pdbs.values():
+            self._register_pdb(pdb)
+        for pod in self.pods.values():
+            members = self._matching_budgets(pod.namespace, pod.labels)
+            self._pdb_members[pod.key] = members
+            healthy = 1 if pod.healthy else 0
+            for key in members:
+                counts = self._pdb_counts.setdefault(key, [0, 0])
+                counts[0] += 1
+                counts[1] += healthy
+        self.metrics["budget_index_builds"] += 1
+
+    def budget_status(self, pdb: SimPDB) -> dict[str, int]:
+        """Current budget numbers from the index.  Cost: O(1) in pod count."""
+        counts = self._pdb_counts.get((pdb.namespace, pdb.name), [0, 0])
+        self.metrics["budget_state_reads"] += 1
+        return pdb.budget_from_counts(counts[0], counts[1])
+
+    def reconcile_budget_index(self) -> None:
+        """Full pod walk that cross-checks the index (tests and drills only).
+
+        Its cost grows with the pod count by design, so it is never called on
+        a normal request path.  ``budget_pod_scans`` records how many such
+        walks happened.
+        """
+        self.metrics["budget_pod_scans"] += 1
+        expected: dict[tuple[str, str], list[int]] = {
+            key: [0, 0] for key in self.pdbs
+        }
+        for pod in self.pods.values():
+            for key in self._matching_budgets(pod.namespace, pod.labels):
+                counts = expected.setdefault(key, [0, 0])
+                counts[0] += 1
+                counts[1] += 1 if pod.healthy else 0
+        for key, counts in expected.items():
+            if self._pdb_counts.get(key) != counts:
+                raise RuntimeError(
+                    f"预算索引不一致 {key}: 索引 {self._pdb_counts.get(key)}，"
+                    f"全量重算 {counts}"
+                )
+        if set(self._pdb_members) != set(self.pods):
+            missing = set(self.pods) - set(self._pdb_members)
+            extra = set(self._pdb_members) - set(self.pods)
+            raise RuntimeError(f"预算成员索引不一致：缺少 {missing}，多余 {extra}")
 
     def _event(self, kind: str, message: str, **extra: Any) -> None:
         self.events.insert(
@@ -263,7 +455,7 @@ class ClusterState:
         }
 
     def pdb_json(self, pdb: SimPDB) -> dict[str, Any]:
-        status = pdb.budget(list(self.pods.values()))
+        status = self.budget_status(pdb)
         spec: dict[str, Any] = {"selector": {"matchLabels": dict(pdb.selector)}}
         if pdb.min_available is not None:
             spec["minAvailable"] = pdb.min_available
@@ -460,29 +652,36 @@ async def evict_pod(namespace: str, name: str, request: Request) -> Response:
                 status_code=201,
             )
         matching_pdbs = [
-            pdb
-            for pdb in STATE.pdbs.values()
-            if pdb.namespace == namespace
-            and all(pod.labels.get(k) == v for k, v in pdb.selector.items())
+            STATE.pdbs[key]
+            for key in STATE._matching_budgets(pod.namespace, pod.labels)
         ]
-        # Kubernetes counts the candidate pod as healthy when deciding; the
-        # eviction is allowed while disruptionsAllowed is positive and the
-        # status recomputes once the pod starts terminating.
+        # Recompute from the index, then apply this one candidate: a pod is
+        # healthy when counted, so one disruption is needed.  A rejected
+        # eviction touches neither the index nor the pod object.
         for pdb in matching_pdbs:
-            allowed = pdb.budget(list(STATE.pods.values()))["disruptionsAllowed"]
-            if allowed <= 0:
+            status = STATE.budget_status(pdb)
+            if status["disruptionsAllowed"] <= 0:
                 STATE._event(
                     "eviction-blocked",
-                    f"{namespace}/{name} 受 {pdb.namespace}/{pdb.name} 阻挡",
+                    f"{namespace}/{name} 受 {pdb.namespace}/{pdb.name} 阻挡"
+                    f"（健康 {status['currentHealthy']}，"
+                    f"期望 {status['desiredHealthy']}）",
                 )
                 return status_response(
                     429,
                     "TooManyRequests",
                     "Cannot evict pod as it would violate the pod's disruption budget.",
                 )
+        was_healthy = pod.healthy
         pod.terminating = True
         pod.deletion_timestamp = _now_iso()
         pod.resource_version += 1
+        # The granted eviction makes the pod unhealthy immediately (healthy
+        # count drops now); matching count only drops when it exits.  Only a
+        # healthy -> unhealthy transition consumes budget, so an already
+        # unhealthy pod does not decrement the healthy count twice.
+        if was_healthy and not pod.healthy:
+            STATE._adjust_pod_health(pod, -1)
         STATE._event("eviction", f"{namespace}/{name} 获准驱逐")
         return JSONResponse(
             {
@@ -572,12 +771,108 @@ def sim_state() -> dict[str, Any]:
                     "minAvailable": pdb.min_available,
                     "maxUnavailable": pdb.max_unavailable,
                     "generation": pdb.generation,
-                    **pdb.budget(pods),
+                    **STATE.budget_status(pdb),
                 }
                 for pdb in sorted(STATE.pdbs.values(), key=lambda p: (p.namespace, p.name))
             ],
+            "metrics": dict(STATE.metrics),
             "events": STATE.events[:40],
         }
+
+
+@app.post("/api/sim/budget-index/reconcile")
+def reconcile_budget_index() -> Response:
+    """Full walk over all pods, used only to cross-check the index."""
+    with STATE.lock:
+        try:
+            STATE.reconcile_budget_index()
+        except RuntimeError as exc:
+            return status_response(500, "InternalError", str(exc))
+        return JSONResponse(
+            {
+                "ok": True,
+                "pods": len(STATE.pods),
+                "budgets": [STATE.budget_status(pdb) | {"name": pdb.name} for pdb in STATE.pdbs.values()],
+                "metrics": dict(STATE.metrics),
+            }
+        )
+
+
+@app.post("/api/sim/budget-index/benchmark")
+async def benchmark_budget_index(request: Request) -> Response:
+    """Add background pods, then measure one budget read + eviction cycle.
+
+    The point of the exercise: per-operation cost must not grow with the
+    number of pods.  ``budget_pod_scans`` staying 0 while ``pods`` grows is
+    the observable proof that no full pod walk happens on these paths.
+    """
+    body: dict[str, Any] = {}
+    if request.headers.get("content-length") not in (None, "0"):
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+    extra = max(0, int(body.get("pods", 500)))
+    with STATE.lock:
+        if extra:
+            # Give the benchmark pods a label no seeded budget selects, so
+            # they raise the pod count without changing any budget.
+            for index in range(extra):
+                pod = SimPod(
+                    namespace="bench",
+                    name=f"bench-{index:05d}",
+                    node="node-c",
+                    labels={"app": "bench"},
+                )
+                STATE.pods[pod.key] = pod
+                STATE._attach_pod(pod)
+
+        before = dict(STATE.metrics)
+        pdb = STATE.pdbs.get(("shop", "web-pdb"))
+        reads = 0
+        edges = 0
+        if pdb is not None:
+            for _ in range(100):
+                STATE.budget_status(pdb)
+                reads += 1
+        if pdb is not None and ("bench", "bench-00000") in STATE.pods:
+            # Apply a grant edge and an exit edge to one bench pod; the index
+            # maintenance cost is per-pod, not per-cluster.
+            victim = STATE.pods[("bench", "bench-00000")]
+            was_healthy = victim.healthy
+            victim.terminating = True
+            victim.deletion_timestamp = _now_iso()
+            STATE._refresh_pod_health(victim, was_healthy)
+            STATE._detach_pod(victim)
+            del STATE.pods[victim.key]
+            edges = 1
+        after = dict(STATE.metrics)
+        return JSONResponse(
+            {
+                "pods": len(STATE.pods),
+                "budget_reads": reads,
+                "edges": edges,
+                "pod_scans_added": after["budget_pod_scans"]
+                - before["budget_pod_scans"],
+                "index_builds_total": after["budget_index_builds"],
+                "index_updates_added": after["budget_index_updates"]
+                - before["budget_index_updates"],
+                "metrics": after,
+            }
+        )
+        after = dict(STATE.metrics)
+        return JSONResponse(
+            {
+                "pods": len(STATE.pods),
+                "budget_reads": reads,
+                "pod_scans_added": after["budget_pod_scans"]
+                - before["budget_pod_scans"],
+                "index_builds_total": after["budget_index_builds"],
+                "index_updates_added": after["budget_index_updates"]
+                - before["budget_index_updates"],
+                "metrics": after,
+            }
+        )
 
 
 @app.post("/api/sim/budgets/{namespace}/{name}")
@@ -607,6 +902,10 @@ async def update_budget(namespace: str, name: str, request: Request) -> Response
             return status_response(422, "Invalid", "需要 minAvailable 或 maxUnavailable")
         pdb.generation += 1
         pdb.resource_version += 1
+        # The selector did not change, so membership is unchanged; only the
+        # desired-health formula changes.  Numbers are recomputed lazily from
+        # the O(1) counts, so no pod walk is needed here.
+        return JSONResponse(STATE.pdb_json(pdb))
         STATE._event(
             "budget",
             f"预算 {namespace}/{name} 调整为 "
@@ -646,7 +945,9 @@ async def replace_pod(namespace: str, name: str, request: Request) -> Response:
             static=old.static,
             ready=ready,
         )
+        STATE._detach_pod(old)
         STATE.pods[replacement.key] = replacement
+        STATE._attach_pod(replacement)
         STATE._event(
             "replace",
             f"{namespace}/{name} 同名重建：UID {old.uid[:8]} → {replacement.uid[:8]}，节点 {node}",
@@ -696,6 +997,7 @@ async def create_pod(request: Request) -> Response:
             phase=str(body.get("phase") or "Running"),
         )
         STATE.pods[pod.key] = pod
+        STATE._attach_pod(pod)
         STATE._event("create", f"创建 Pod {namespace}/{name} 于 {node}")
         return JSONResponse(STATE.pod_json(pod), status_code=201)
 
@@ -707,8 +1009,10 @@ async def set_ready(namespace: str, name: str, request: Request) -> Response:
         pod = _find_pod(namespace, name)
         if pod is None:
             return status_response(404, "NotFound", f'pods "{name}" not found')
+        before = pod.healthy
         pod.ready = bool(body.get("ready", True))
         pod.resource_version += 1
+        STATE._refresh_pod_health(pod, before)
         STATE._event(
             "ready",
             f"{namespace}/{name} 标记为{'就绪' if pod.ready else '未就绪'}",
@@ -725,6 +1029,7 @@ async def finish_terminating(namespace: str, name: str) -> Response:
             return status_response(404, "NotFound", f'pods "{name}" not found')
         if not pod.terminating:
             return status_response(409, "Conflict", "Pod 尚未进入退出流程，拒绝直接移除")
+        STATE._detach_pod(pod)
         del STATE.pods[pod.key]
         STATE._event("exit", f"{namespace}/{name} 已退出节点 {pod.node}")
         return JSONResponse({"exited": True, "namespace": namespace, "name": name})
@@ -739,6 +1044,7 @@ def finish_all_terminating() -> dict[str, Any]:
             if pod.terminating
         ]
         for pod in [p for p in STATE.pods.values() if p.terminating]:
+            STATE._detach_pod(pod)
             STATE.pods.pop(pod.key, None)
         if finished:
             STATE._event("exit", f"{len(finished)} 个待退出 Pod 已退出")

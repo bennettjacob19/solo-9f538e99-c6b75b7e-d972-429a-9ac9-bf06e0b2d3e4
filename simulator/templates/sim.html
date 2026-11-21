@@ -66,11 +66,22 @@
     </section>
 
     <section class="panel">
-      <h2>PodDisruptionBudget</h2>
+      <h2>PodDisruptionBudget（实时读数）</h2>
       <table>
-        <thead><tr><th>预算</th><th>选择器</th><th>规则</th><th>允许中断</th><th>健康/期望</th><th>调整</th></tr></thead>
+        <thead><tr><th>预算</th><th>选择器</th><th>规则</th><th>匹配数</th><th>健康数</th><th>期望健康数</th><th>允许驱逐数</th><th>调整</th></tr></thead>
         <tbody id="budgets"></tbody>
       </table>
+      <p class="hint">预算由增量索引计数：驱逐获准时健康数立刻减少；Pod 实际退出后匹配数才减少；使用 maxUnavailable 时期望健康数随匹配数变化。</p>
+    </section>
+
+    <section class="panel">
+      <h2>预算索引自检</h2>
+      <div class="row">
+        <button onclick="act('/api/sim/budget-index/reconcile', {})">全量核对索引</button>
+        <button onclick="act('/api/sim/budget-index/benchmark', {})">增加 Pod 总数并测遍历</button>
+        <span class="hint" id="index-metrics" class="mono"></span>
+      </div>
+      <p class="hint">全量核对会遍历所有 Pod（成本随 Pod 数增长），仅用于自测；正常请求路径不做全量遍历。</p>
     </section>
 
     <section class="panel">
@@ -129,8 +140,10 @@ async function load() {
       <td class="mono">${b.namespace}/${b.name}</td>
       <td class="mono">${JSON.stringify(b.selector)}</td>
       <td>${rule}</td>
+      <td class="mono">${b.expectedPods}</td>
+      <td class="mono">${b.currentHealthy}</td>
+      <td class="mono">${b.desiredHealthy}</td>
       <td>${b.disruptionsAllowed > 0 ? badge(b.disruptionsAllowed,'ok') : badge('0','danger')}</td>
-      <td>${b.currentHealthy}/${b.desiredHealthy}（共 ${b.expectedPods}）</td>
       <td><div class="row">
         <input id="budget-${id}" type="number" min="0" value="${b.minAvailable != null ? b.minAvailable : b.maxUnavailable}">
         <select id="mode-${id}">
@@ -141,6 +154,12 @@ async function load() {
       </div></td>
     </tr>`;
   }).join('');
+
+  const m = state.metrics || {};
+  document.getElementById('index-metrics').textContent =
+    `Pod ${state.pods.length} 个 · 索引构建 ${m.budget_index_builds ?? 0} 次 · ` +
+    `预算读数 ${m.budget_state_reads ?? 0} 次 · 索引更新 ${m.budget_index_updates ?? 0} 次 · ` +
+    `全量遍历 ${m.budget_pod_scans ?? 0} 次`;
 
   document.getElementById('log').innerHTML = state.events.map(e =>
     `<div><span class="mono muted">${e.at}</span> · ${e.message}</div>`).join('') || '<div class="muted">暂无事件</div>';

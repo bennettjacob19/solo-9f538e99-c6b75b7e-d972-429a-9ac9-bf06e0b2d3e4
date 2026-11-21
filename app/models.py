@@ -101,8 +101,8 @@ class PodBudget:
     @property
     def summary(self) -> str:
         text = (
-            f"允许中断 {self.allowed}，健康 {self.healthy}/{self.desired}，"
-            f"共 {self.expected} 个"
+            f"允许驱逐 {self.allowed}，健康 {self.healthy}/{self.desired}，"
+            f"匹配 {self.expected}"
         )
         return text + ("（状态待同步）" if self.stale else "")
 

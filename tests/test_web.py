@@ -89,3 +89,31 @@ def test_unknown_round_renders_notice(client):
     assert response.status_code == 200
     assert "无法显示排空轮次" in response.text
     assert "不存在" in response.text
+
+
+def test_round_page_shows_latest_budget_readings_after_threshold_change(client, sim):
+    round_id = start(client)
+    sim.post("/api/sim/budgets/shop/web-pdb", json={"minAvailable": 4})
+
+    page = client.get(f"/drain/{round_id}").text
+    assert "最新读数" in page
+    assert "匹配数" in page and "期望健康数" in page and "允许驱逐数" in page
+
+    import re
+
+    def budget_cells(html: str) -> list[str]:
+        row = re.search(r"shop/web-pdb</td>(.*?)</tr>", html, re.S)
+        assert row is not None
+        return [
+            re.sub(r"<[^>]+>", "", cell).strip()
+            for cell in row.group(1).split("</td>")[:4]
+        ]
+
+    # The page reflects the freshly read budget, not a snapshot from start.
+    assert budget_cells(page) == ["5", "5", "4", "1"]
+
+    # A granted eviction immediately lowers the healthy count on next view.
+    sim.post("/api/v1/namespaces/shop/pods/web-0/eviction", json={})
+    page = client.get(f"/drain/{round_id}").text
+    assert budget_cells(page) == ["5", "4", "4", "0"]
+
